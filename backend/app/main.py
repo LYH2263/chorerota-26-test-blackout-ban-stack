@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.rota import build_week_slots, swap_legal, apply_swap
+from app.engines.rota import build_week_slots, swap_legal, apply_swap, UnfillableSlotError
 
 app = FastAPI(title="Chorerota", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,6 +41,54 @@ def add_task(body: dict):
 def list_weeks():
     c = connect(); rows = [dict(r) for r in c.execute("SELECT * FROM weeks")]; c.close(); return rows
 
+@app.post("/api/weeks")
+def add_week(body: dict):
+    c = connect()
+    cur = c.execute("INSERT INTO weeks(label,status) VALUES (?,?)", (body.get("label", "新周"), "draft"))
+    c.commit(); wid = cur.lastrowid; c.close(); return {"id": wid}
+
+def _load_constraints(c):
+    """忌日/禁配登记 → 引擎口径的 {member_id: {day}} / {member_id: {task_id}}。"""
+    blackout = {}
+    for r in c.execute("SELECT member_id, day FROM member_blackouts"):
+        blackout.setdefault(r["member_id"], set()).add(r["day"])
+    forbidden = {}
+    for r in c.execute("SELECT member_id, task_id FROM forbidden_pairs"):
+        forbidden.setdefault(r["member_id"], set()).add(r["task_id"])
+    return blackout, forbidden
+
+@app.get("/api/members/{member_id}/blackouts")
+def list_member_blackouts(member_id: int):
+    c = connect()
+    days = [r["day"] for r in c.execute(
+        "SELECT day FROM member_blackouts WHERE member_id=? ORDER BY day", (member_id,))]
+    c.close(); return {"member_id": member_id, "days": days}
+
+@app.post("/api/members/{member_id}/blackouts")
+def add_member_blackout(member_id: int, body: dict):
+    c = connect()
+    if not c.execute("SELECT 1 FROM members WHERE id=?", (member_id,)).fetchone():
+        c.close(); raise HTTPException(404, "member not found")
+    c.execute("INSERT OR IGNORE INTO member_blackouts(member_id,day) VALUES (?,?)",
+              (member_id, int(body["day"])))
+    c.commit(); c.close(); return {"ok": True}
+
+@app.get("/api/forbidden-pairs")
+def list_forbidden_pairs(member_id: int | None = None, task_id: int | None = None):
+    sql, args = "SELECT * FROM forbidden_pairs WHERE 1=1", []
+    if member_id is not None:
+        sql += " AND member_id=?"; args.append(member_id)
+    if task_id is not None:
+        sql += " AND task_id=?"; args.append(task_id)
+    c = connect(); rows = [dict(r) for r in c.execute(sql, args)]; c.close(); return rows
+
+@app.post("/api/forbidden-pairs")
+def add_forbidden_pair(body: dict):
+    c = connect()
+    c.execute("INSERT OR IGNORE INTO forbidden_pairs(member_id,task_id) VALUES (?,?)",
+              (int(body["member_id"]), int(body["task_id"])))
+    c.commit(); c.close(); return {"ok": True}
+
 @app.get("/api/weeks/{week_id}/board")
 def week_board(week_id: int):
     c = connect()
@@ -65,7 +113,11 @@ def generate(week_id: int, body: GenBody = GenBody()):
     if not week: c.close(); raise HTTPException(404, "week not found")
     mids = [r["id"] for r in c.execute("SELECT id FROM members WHERE active=1 AND data_quality='clean' ORDER BY id")]
     tids = [r["id"] for r in c.execute("SELECT id FROM tasks WHERE data_quality='clean' AND weight>0 ORDER BY id")]
-    slots = build_week_slots(mids, tids, days=body.days)
+    blackout, forbidden = _load_constraints(c)
+    try:
+        slots = build_week_slots(mids, tids, days=body.days, blackout=blackout, forbidden=forbidden)
+    except UnfillableSlotError as e:
+        c.close(); raise HTTPException(409, str(e))  # 可派成员不足：不写任何格
     c.execute("DELETE FROM assignments WHERE week_id=?", (week_id,))
     for s in slots:
         c.execute("INSERT INTO assignments(week_id,day,task_id,member_id) VALUES (?,?,?,?)",
@@ -81,7 +133,9 @@ class SwapBody(BaseModel):
 def request_swap(week_id: int, body: SwapBody):
     c = connect()
     assigns = [dict(r) for r in c.execute("SELECT day,task_id,member_id FROM assignments WHERE week_id=?", (week_id,))]
-    check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task)
+    blackout, forbidden = _load_constraints(c)
+    check = swap_legal(assigns, body.a_day, body.a_task, body.b_day, body.b_task,
+                       blackout=blackout, forbidden=forbidden)
     if not check["ok"]:
         c.close(); raise HTTPException(400, check["reason"])
     cur = c.execute(
@@ -104,8 +158,10 @@ def confirm_swap(swap_id: int):
     assigns = [dict(r) for r in c.execute(
         "SELECT id,day,task_id,member_id FROM assignments WHERE week_id=?", (sw["week_id"],))]
     slots = [{"day": a["day"], "task_id": a["task_id"], "member_id": a["member_id"]} for a in assigns]
+    blackout, forbidden = _load_constraints(c)
     try:
-        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"])
+        new_slots = apply_swap(slots, sw["a_day"], sw["a_task"], sw["b_day"], sw["b_task"],
+                               blackout=blackout, forbidden=forbidden)
     except ValueError as e:
         c.close(); raise HTTPException(400, str(e))
     for a, s in zip(assigns, new_slots):
